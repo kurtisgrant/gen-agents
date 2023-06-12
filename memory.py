@@ -47,7 +47,7 @@ class Memory_Stream:
         recency_score = 0.99 ** hours_since_last_accessed
         return recency_score
 
-    def query(self, query=None):
+    def query(self, query=None, num_results=5):
         recent_memories = self.get_most_recent_memory()
         memory_scores = []
 
@@ -61,8 +61,8 @@ class Memory_Stream:
             recency = self.get_recency(memory["id"])
             memory_scores.append((relevance + importance + recency, memory))
 
-        # Use heapq to get the top 3 memories
-        top_memories = heapq.nlargest(3, memory_scores)
+        # Use heapq to get the top memories
+        top_memories = heapq.nlargest(num_results, memory_scores)
         # Extract the memory from each tuple in top_memories
         memories_to_return = [memory for score, memory in top_memories]
         # Update the last accessed time for each memory
@@ -80,6 +80,21 @@ class Memory_Stream:
 
     def get_memory_content(self, memories_list):
         return [memory["content"] for memory in memories_list]
+    
+    @staticmethod
+    def get_memory_strings(self, memory_list, timestamps=True, type=True, details=False):
+        memory_strings = []
+        for memory in memory_list:
+            memory_string = ""
+            if timestamps:
+                memory_string += f"{memory['timestamp']} - "
+            if type:
+                memory_string += f"{memory['type']}: "
+            memory_string += f"{memory['content']}"
+            if details:
+                memory_string += f"\n(id: {memory['id']}, importance: {memory['importance']}, recency: {self.get_recency(memory['id'])}, last accessed: {memory['last_accessed']})"
+            memory_strings.append(memory_string)
+        return memory_strings
 
     def load_burt_memories(self):
         temp_memories = [
