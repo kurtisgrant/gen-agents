@@ -12,9 +12,10 @@ class Agent:
         self.bio = bio
         self.current_task = None
         self.memory_stream = Memory_Stream(sandbox)
+    
+    def init_memory_from_bio(self):
         for chunk in self.bio.split(";"):
             self.memory_stream.add_memory(type="OBSERVATION", content=chunk)
-    
 
     @staticmethod
     def burt():

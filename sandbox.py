@@ -14,6 +14,10 @@ class Sandbox:
 
     def get_time(self):
         return self.simulation_time.strftime("%Y-%m-%d %H:%M") # Convert datetime to string
+    
+    # Update simulation time to timestamp
+    def set_time(self, timestamp):
+        self.simulation_time = datetime.datetime.strptime(timestamp, "%Y-%m-%d %H:%M")
 
     def advance(self):
         # Add 5 minutes to the simulation time

@@ -1,11 +1,27 @@
+import os
+from apikey import apikey
+
 from collections import defaultdict
 import heapq
-from prompts import rate_importance
 import numpy as np
 import datetime
 import random
+import json
+
 from langchain.embeddings import OpenAIEmbeddings
+from langchain.llms import OpenAI
+from langchain.prompts import PromptTemplate
+from langchain.chains import LLMChain
+from langchain.output_parsers import StructuredOutputParser, ResponseSchema
+
+from text import importance_examples, importance_advice
+
+os.environ['OPENAI_API_KEY'] = apikey
+
+llm = OpenAI(temperature=0.9)
+
 embeddings = OpenAIEmbeddings()
+
 
 class Memory_Stream:
     def __init__(self, sandbox):
@@ -23,17 +39,68 @@ class Memory_Stream:
             "last_accessed": self.sandbox.get_time(),
             "type": type,
             "content": content,
-            "importance": rate_importance(content),
+            "importance": self.get_importance(content),
             "embedded_content": embeddings.embed_query(content)
         }
         self.mem_count += 1
         self.memories.append(memory)
         self.memories_dict[memory["id"]] = memory  # Store memory in dict as well
+        return memory
+
+    def get_importance(self, memory_str):
+
+        importance_schema = ResponseSchema(name='rating', description=f'The score given to the memory. A number between 1 and 10. {importance_advice}', type='number')
+        output_parser = StructuredOutputParser.from_response_schemas([importance_schema])
+        format_instructions = output_parser.get_format_instructions()
+
+        importance_template = PromptTemplate(
+            input_variables = ['query', 'format_instructions'],
+            template="Please rate the importance of the following memory on a scale of 1-10: {query} \n\n{format_instructions}\n\n"
+        )
+
+        importance_chain = LLMChain(llm=llm, prompt=importance_template, verbose=False)
+        format_instructions = output_parser.get_format_instructions()
+        # On error, log and try again up to 5 times
+        for i in range(5):
+            try:
+                response = output_parser.parse(importance_chain.run(query=memory_str, format_instructions=format_instructions))
+                break
+            except Exception as e:
+                print(e)
+                continue
+        return response['rating']
+    
+    def recalculate_importances(self, verbose=False):
+        for memory in self.memories:
+            if verbose:
+                print(f"Calculating importance of memory {memory['id']}")
+                print(f"Memory: {memory['content']}")
+                print(f"Importance: {memory['importance']}")
+            memory["importance"] = self.get_importance(memory["content"])
+            if verbose:
+                print(f"New importance: {memory['importance']}")
+
 
     def get_memory(self, id):
         if id not in self.memories_dict:
             raise Exception(f"Memory with id {id} not found")
         return self.memories_dict[id]
+    
+    # Export memories to JSON file
+    def export(self, filename):
+        filename = filename + ".mems"
+        with open(filename, "w") as f:
+            json.dump(self.memories, f)
+    
+    # Import memories from JSON file
+    def import_memories(self, filename):
+        filename = filename + ".mems"
+        with open(filename, "r") as f:
+            self.memories = json.load(f)
+        self.memories_dict = {memory["id"]: memory for memory in self.memories}
+        self.mem_count = len(self.memories)
+        # Update sandbox time to the last time a memory was added
+        self.sandbox.set_time(self.memories[-1]["timestamp"])
 
     def access(self, id):
         memory = self.get_memory(id)
@@ -46,9 +113,9 @@ class Memory_Stream:
         hours_since_last_accessed = (current_time - last_accessed_time).total_seconds() / 3600
         recency_score = 0.99 ** hours_since_last_accessed
         return recency_score
-
-    def query(self, query=None, num_results=5):
-        recent_memories = self.get_most_recent_memory()
+    
+    def query(self, query=None, num_results=5, weights=(0.5, 0.3, 0.2), verbose=False):
+        recent_memories = self.get_recent_memories()
         memory_scores = []
 
         for memory in recent_memories:
@@ -57,20 +124,38 @@ class Memory_Stream:
                 relevance = np.dot(memory["embedded_content"], query_embedding)
             else:
                 relevance = 0
-            importance = float(memory["importance"]) / 10.0  # Cast importance to float for precision
+            importance = float(memory["importance"]) / 10.0  # Normalize importance
             recency = self.get_recency(memory["id"])
-            memory_scores.append((relevance + importance + recency, memory))
+
+            # Weight the scores
+            weighted_score = weights[0] * relevance + weights[1] * importance + weights[2] * recency
+
+            if verbose:
+                print(f"\nMemory: [node_{memory['id']}] {memory['timestamp']}: {memory['content']}")
+                print(f"Relevance: {relevance}")
+                print(f"Weighted relevance: {weights[0] * relevance}")
+                print(f"Importance: {importance}")
+                print(f"Weighted importance: {weights[1] * importance}")
+                print(f"Recency: {recency}")
+                print(f"Weighted recency: {weights[2] * recency}")
+                print(f"Weighted score: {weighted_score}")
+
+            memory_scores.append((weighted_score, memory))
 
         # Use heapq to get the top memories
         top_memories = heapq.nlargest(num_results, memory_scores)
         # Extract the memory from each tuple in top_memories
         memories_to_return = [memory for score, memory in top_memories]
         # Update the last accessed time for each memory
-        for memory in memories_to_return:
+        for score, memory in top_memories:
+            if verbose:
+                print(f"\nMemory: [node_{memory['id']}] {memory['timestamp']}: {memory['content']}")
+                print(f"Weighted score: {score}")
             self.access(memory["id"])
         return memories_to_return
+
     
-    def get_most_recent_memory(self, number=50):
+    def get_recent_memories(self, number=100):
         return self.memories[-number:]
 
     def print_memory(self, id):
@@ -81,85 +166,149 @@ class Memory_Stream:
     def get_memory_content(self, memories_list):
         return [memory["content"] for memory in memories_list]
     
-    @staticmethod
-    def get_memory_strings(self, memory_list, timestamps=True, type=True, details=False):
-        memory_strings = []
-        for memory in memory_list:
-            memory_string = ""
-            if timestamps:
-                memory_string += f"{memory['timestamp']} - "
-            if type:
-                memory_string += f"{memory['type']}: "
-            memory_string += f"{memory['content']}"
-            if details:
-                memory_string += f"\n(id: {memory['id']}, importance: {memory['importance']}, recency: {self.get_recency(memory['id'])}, last accessed: {memory['last_accessed']})"
-            memory_strings.append(memory_string)
-        return memory_strings
+    def extract_insights(self, memories_list):
+        insights_template = PromptTemplate(
+            input_variables = ['memories', 'format_instructions'],
+            template = 'What 5 high-level insights can you infer from the memories provided  \n\nMEMORIES: {memories}\n\n{format_instructions}\n\n'
+        )
+        insights_chain = LLMChain(llm=llm, prompt=insights_template, verbose=True)
 
-    def load_burt_memories(self):
-        temp_memories = [
-            {'id': 0, 'timestamp': '2023-06-11 07:00', 'last_accessed': '2023-06-11 07:00', 'type': 'OBSERVATION', 'content': 'Burt rises with the sun, ready to start his day.', 'importance': 6},
-            {'id': 1, 'timestamp': '2023-06-11 07:05', 'last_accessed': '2023-06-11 07:05', 'type': 'OBSERVATION', 'content': 'Burt fetches fresh water from the well for his morning coffee.', 'importance': '6'},
-            {'id': 2, 'timestamp': '2023-06-11 07:10', 'last_accessed': '2023-06-11 07:10', 'type': 'OBSERVATION', 'content': 'With a cup in hand, Burt admires the morning dew on his crops.', 'importance': '7'},
-            {'id': 3, 'timestamp': '2023-06-11 07:25', 'last_accessed': '2023-06-11 07:25', 'type': 'OBSERVATION', 'content': 'Burt heads to the barn to tend to his animals.', 'importance': 5},
-            {'id': 4, 'timestamp': '2023-06-11 07:30', 'last_accessed': '2023-06-11 07:30', 'type': 'OBSERVATION', 'content': 'The chickens cluck happily as Burt gathers the eggs for the day.', 'importance': '4'},
-            {'id': 5, 'timestamp': '2023-06-11 07:35', 'last_accessed': '2023-06-11 07:35', 'type': 'OBSERVATION', 'content': 'Burt takes a moment to pet his old farm dog, Rover.', 'importance': '8'},
-            {'id': 6, 'timestamp': '2023-06-11 07:50', 'last_accessed': '2023-06-11 07:50', 'type': 'OBSERVATION', 'content': 'Burt visits the pig pen, giving each pig a healthy serving of feed.', 'importance': 4},
-            {'id': 7, 'timestamp': '2023-06-11 07:55', 'last_accessed': '2023-06-11 07:55', 'type': 'OBSERVATION', 'content': 'Burt spends some time brushing down his horse, Buttercup.', 'importance': '7'},
-            {'id': 8, 'timestamp': '2023-06-11 08:10', 'last_accessed': '2023-06-11 08:10', 'type': 'OBSERVATION', 'content': 'Buttercup neighs happily, appreciating the attention.', 'importance': 8},
-            {'id': 9, 'timestamp': '2023-06-11 08:15', 'last_accessed': '2023-06-11 08:15', 'type': 'OBSERVATION', 'content': 'Burt sets to work in the fields, tending to his crops.', 'importance': '5'},
-            {'id': 10, 'timestamp': '2023-06-11 08:20', 'last_accessed': '2023-06-11 08:20', 'type': 'OBSERVATION', 'content': 'He notices that the corn is growing taller each day.', 'importance': '7'},
-            {'id': 11, 'timestamp': '2023-06-11 08:35', 'last_accessed': '2023-06-11 08:35', 'type': 'OBSERVATION', 'content': "Burt makes a note to repair a section of the fence that's starting to sag.", 'importance': '3'},
-            {'id': 12, 'timestamp': '2023-06-11 08:50', 'last_accessed': '2023-06-11 08:50', 'type': 'OBSERVATION', 'content': 'He takes a break under an old oak tree, sipping his water from a flask.', 'importance': '7'},
-            {'id': 13, 'timestamp': '2023-06-11 09:00', 'last_accessed': '2023-06-11 09:00', 'type': 'OBSERVATION', 'content': 'The postman drives by, waving at Burt, delivering the mail.', 'importance': '4'},
-            {'id': 14, 'timestamp': '2023-06-11 09:05', 'last_accessed': '2023-06-11 09:05', 'type': 'OBSERVATION', 'content': 'Burt reads a letter from his sister who lives in the city.', 'importance': '6'},
-            {'id': 15, 'timestamp': '2023-06-11 09:15', 'last_accessed': '2023-06-11 09:15', 'type': 'OBSERVATION', 'content': 'A light breeze picks up, and Burt can smell rain on the horizon.', 'importance': '8'},
-            {'id': 16, 'timestamp': '2023-06-11 09:30', 'last_accessed': '2023-06-11 09:30', 'type': 'OBSERVATION', 'content': 'Burt decides to repair the fence before the rain comes.', 'importance': '5'},
-            {'id': 17, 'timestamp': '2023-06-11 09:45', 'last_accessed': '2023-06-11 09:45', 'type': 'OBSERVATION', 'content': "With the fence mended, Burt is satisfied with his morning's work.", 'importance': 5},
-            {'id': 18, 'timestamp': '2023-06-11 09:55', 'last_accessed': '2023-06-11 09:55', 'type': 'OBSERVATION', 'content': 'As he walks back to the house, Burt spots a fox darting into the woods.', 'importance': '8'},
-            {'id': 19, 'timestamp': '2023-06-11 10:00', 'last_accessed': '2023-06-11 10:00', 'type': 'OBSERVATION', 'content': "Burt enters his quaint home, it's time for a hearty lunch.", 'importance': 5},
-            {'id': 20, 'timestamp': '2023-06-11 10:15', 'last_accessed': '2023-06-11 10:15', 'type': 'OBSERVATION', 'content': 'Over lunch, Burt plans out the rest of his day.', 'importance': '3'},
-            {'id': 21, 'timestamp': '2023-06-11 10:25', 'last_accessed': '2023-06-11 10:25', 'type': 'OBSERVATION', 'content': 'Finishing lunch, Burt heads out despite the drizzling rain.', 'importance': 5},
-            {'id': 22, 'timestamp': '2023-06-11 10:35', 'last_accessed': '2023-06-11 10:35', 'type': 'OBSERVATION', 'content': 'Burt spends the afternoon fixing a leak in the barn roof.', 'importance': 4},
-            {'id': 23, 'timestamp': '2023-06-11 10:45', 'last_accessed': '2023-06-11 10:45', 'type': 'OBSERVATION', 'content': 'He spots a family of birds nesting in the rafters of the barn.', 'importance': '8'},
-            {'id': 24, 'timestamp': '2023-06-11 11:00', 'last_accessed': '2023-06-11 11:00', 'type': 'OBSERVATION', 'content': 'Taking a break, Burt enjoys watching the birds flutter around.', 'importance': 8},
-            {'id': 25, 'timestamp': '2023-06-11 11:10', 'last_accessed': '2023-06-11 11:10', 'type': 'OBSERVATION', 'content': 'Burt visits his vegetable garden, picking some fresh produce for dinner.', 'importance': '7'},
-            {'id': 26, 'timestamp': '2023-06-11 11:25', 'last_accessed': '2023-06-11 11:25', 'type': 'OBSERVATION', 'content': 'The tomatoes are ripe and juicy, perfect for a salad.', 'importance': '5'},
-            {'id': 27, 'timestamp': '2023-06-11 11:30', 'last_accessed': '2023-06-11 11:30', 'type': 'OBSERVATION', 'content': 'Burt smiles as he observes a healthy patch of pumpkins growing nicely.', 'importance': '7'},
-            {'id': 28, 'timestamp': '2023-06-11 11:35', 'last_accessed': '2023-06-11 11:35', 'type': 'OBSERVATION', 'content': "As the rain stops, a rainbow forms in the sky, much to Burt's delight.", 'importance': '10'},
-            {'id': 29, 'timestamp': '2023-06-11 11:40', 'last_accessed': '2023-06-11 11:40', 'type': 'OBSERVATION', 'content': 'Burt takes a moment to appreciate the beauty of his surroundings.', 'importance': 8},
-            {'id': 30, 'timestamp': '2023-06-11 11:45', 'last_accessed': '2023-06-11 11:45', 'type': 'OBSERVATION', 'content': 'In the late afternoon, Burt stacks hay bales in the barn.', 'importance': '3'},
-            {'id': 31, 'timestamp': '2023-06-11 11:55', 'last_accessed': '2023-06-11 11:55', 'type': 'OBSERVATION', 'content': 'Burt greets a neighbour passing by on the country road.', 'importance': 4},
-            {'id': 32, 'timestamp': '2023-06-11 12:05', 'last_accessed': '2023-06-11 12:05', 'type': 'OBSERVATION', 'content': 'He helps his neighbor fix a flat tire on his old truck.', 'importance': 8},
-            {'id': 33, 'timestamp': '2023-06-11 12:20', 'last_accessed': '2023-06-11 12:20', 'type': 'OBSERVATION', 'content': 'With the sun setting, Burt begins to wrap up his tasks for the day.', 'importance': 5},
-            {'id': 34, 'timestamp': '2023-06-11 12:35', 'last_accessed': '2023-06-11 12:35', 'type': 'OBSERVATION', 'content': 'Burt feeds his animals one last time for the day.', 'importance': '7'},
-            {'id': 35, 'timestamp': '2023-06-11 12:45', 'last_accessed': '2023-06-11 12:45', 'type': 'OBSERVATION', 'content': 'Rover follows Burt around, wagging his tail excitedly.', 'importance': '8'},
-            {'id': 36, 'timestamp': '2023-06-11 13:00', 'last_accessed': '2023-06-11 13:00', 'type': 'OBSERVATION', 'content': 'Burt takes a walk around his property, checking everything is secure for the night.', 'importance': '3'},
-            {'id': 37, 'timestamp': '2023-06-11 13:15', 'last_accessed': '2023-06-11 16:05', 'type': 'OBSERVATION', 'content': 'The fireflies start to come out, dotting the evening with their soft glow.', 'importance': '10'},
-            {'id': 38, 'timestamp': '2023-06-11 13:25', 'last_accessed': '2023-06-11 13:25', 'type': 'OBSERVATION', 'content': 'Burt enjoys a simple dinner in his warm, cozy kitchen.', 'importance': '7'},
-            {'id': 39, 'timestamp': '2023-06-11 13:40', 'last_accessed': '2023-06-11 13:40', 'type': 'OBSERVATION', 'content': 'Post-dinner, Burt spends some time whittling by the fireplace.', 'importance': '7'},
-            {'id': 40, 'timestamp': '2023-06-11 13:50', 'last_accessed': '2023-06-11 13:50', 'type': 'OBSERVATION', 'content': 'Burt decides to turn in early for the night.', 'importance': '1'},
-            {'id': 41, 'timestamp': '2023-06-11 13:55', 'last_accessed': '2023-06-11 13:55', 'type': 'OBSERVATION', 'content': 'He makes sure the fire in the fireplace is safely extinguished.', 'importance': 5},
-            {'id': 42, 'timestamp': '2023-06-11 14:00', 'last_accessed': '2023-06-11 14:00', 'type': 'OBSERVATION', 'content': 'Burt takes one last look outside, everything is calm and peaceful.', 'importance': '8'},
-            {'id': 43, 'timestamp': '2023-06-11 14:05', 'last_accessed': '2023-06-11 14:05', 'type': 'OBSERVATION', 'content': "Rover settles down at the foot of Burt's bed, ready to sleep.", 'importance': 6},
-            {'id': 44, 'timestamp': '2023-06-11 14:15', 'last_accessed': '2023-06-11 14:15', 'type': 'OBSERVATION', 'content': 'Burt brushes his teeth, following his nightly routine.', 'importance': 4},
-            {'id': 45, 'timestamp': '2023-06-11 14:25', 'last_accessed': '2023-06-11 14:25', 'type': 'OBSERVATION', 'content': 'He listens to the soft hooting of an owl outside his window.', 'importance': '8'},
-            {'id': 46, 'timestamp': '2023-06-11 14:40', 'last_accessed': '2023-06-11 14:40', 'type': 'OBSERVATION', 'content': 'Burt checks on Buttercup one last time, who is already dozing in her stable.', 'importance': '8'},
-            {'id': 47, 'timestamp': '2023-06-11 14:55', 'last_accessed': '2023-06-11 14:55', 'type': 'OBSERVATION', 'content': 'The farm is quiet, the animals are all settling down for the night.', 'importance': '7'},
-            {'id': 48, 'timestamp': '2023-06-11 15:05', 'last_accessed': '2023-06-11 16:05', 'type': 'OBSERVATION', 'content': 'Burt takes a moment to admire the clear, starry night sky.', 'importance': '10'},
-            {'id': 49, 'timestamp': '2023-06-11 15:10', 'last_accessed': '2023-06-11 16:05', 'type': 'OBSERVATION', 'content': 'The moon is full and bright, casting long shadows across the farm.', 'importance': '10'},
-            {'id': 50, 'timestamp': '2023-06-11 15:20', 'last_accessed': '2023-06-11 15:20', 'type': 'OBSERVATION', 'content': 'Burt climbs into bed, pulling the quilt up to his chin.', 'importance': '5'},
-            {'id': 51, 'timestamp': '2023-06-11 15:35', 'last_accessed': '2023-06-11 15:35', 'type': 'OBSERVATION', 'content': 'As he closes his eyes, he listens to the faint sounds of the farm at night.', 'importance': 8},
-            {'id': 52, 'timestamp': '2023-06-11 15:40', 'last_accessed': '2023-06-11 15:40', 'type': 'OBSERVATION', 'content': 'The day has been long and fulfilling, and Burt quickly drifts off to sleep.', 'importance': 3},
-            {'id': 53, 'timestamp': '2023-06-11 15:55', 'last_accessed': '2023-06-11 15:55', 'type': 'OBSERVATION', 'content': "Even in sleep, Burt's mind is filled with plans for the next day's work.", 'importance': '7'},
-        ]
-        for mem in temp_memories:
-            mem["embedded_content"] = embeddings.embed_query(mem["content"])
-            self.memories.append(mem)
-            self.memories_dict[mem["id"]] = mem
-            # Advance time by 1-3 steps between each observation
+        schema1 = ResponseSchema(name='insight1', description='The first insight', type='string')
+        schema2 = ResponseSchema(name='insight2', description='The second insight', type='string')
+        schema3 = ResponseSchema(name='insight3', description='The third insight', type='string')
+        schema4 = ResponseSchema(name='insight4', description='The fourth insight', type='string')
+        schema5 = ResponseSchema(name='insight5', description='The fifth insight', type='string')
+        output_parser = StructuredOutputParser.from_response_schemas([schema1, schema2, schema3, schema4, schema5])
+        format_instructions = output_parser.get_format_instructions()
+
+        insights = output_parser.parse(insights_chain.run(memories="\n\n".join(memories_list), format_instructions=format_instructions))
+        return insights
+    
+    def reflect(self, verbose=False):
+        memory_list = self.get_recent_memories(50)
+        prompt_template = PromptTemplate(
+            input_variables = ['memories', 'format_instructions'],
+            template = 'Given only the memories above, what are 3 most salient high-level questions we can answer about the subjects in the statements? MEMORIES: {memories}\n\n{format_instructions}\n\n'
+        )
+        generate_questions_chain = LLMChain(llm=llm, prompt=prompt_template, verbose=True)
+
+        question1_schema = ResponseSchema(name='question1', description='The first generated question', type='string')
+        question2_schema = ResponseSchema(name='question2', description='The second generated question', type='string')
+        question3_schema = ResponseSchema(name='question3', description='The third generated question', type='string')
+        output_parser = StructuredOutputParser.from_response_schemas([question1_schema, question2_schema, question3_schema])
+        format_instructions = output_parser.get_format_instructions()
+
+        memories_string = "\n\n".join(fstring_memories(memory_list))
+        questions = output_parser.parse(generate_questions_chain.run(memories=memories_string, format_instructions=format_instructions))
+
+        # For each question, use question as query on memory stream
+        for question in questions.values():
+            if verbose:
+                print(f"\n\nQuestion: {question}")
+            memories = self.query(query=question, num_results=5, verbose=verbose)
+            memory_strings = fstring_memories(memories)
+            memories_string = '\n\n'.join(memory_strings)
+            if verbose:
+                print(f"\n\nRelated Memories: {memories_string}")
+            reflections = self.extract_insights(memory_strings)
+            if verbose:
+                print(f"\n\nReflections: {reflections}")
+            for reflection in reflections.values():
+                self.add_memory(content=reflection, type='REFLECTION')
+
+    def load_observations_through_time(self, observations):
+        for ob in observations:
+            # Advance time 1-3 times
             for _ in range(random.randint(1, 3)):
                 self.sandbox.advance()
-        print("Burt's memories loaded.")
+            self.add_memory(type='OBSERVATION', content=ob)
 
 
+
+def fstring_memories(memories, verbose=False):
+    memory_strings = []
+    for m in memories:
+        memory_string = f"[node_{m['id']}] {m['timestamp']}: {m['content']}"
+        if verbose:
+            memory_string = f"[node_{m['id']}] {m['timestamp']} (i:{m['importance']}): {m['content']}"
+        memory_strings.append(memory_string)
+    return memory_strings
+
+observation_examples = [
+    "common room sofa is idle",
+    "common room sofa is being sat on by Francisco Lopez",
+    "Francisco Lopez is watching a comedy show",
+    "common room table is idle",
+    "cooking area is idle",
+    "kitchen sink is idle",
+    "toaster is idle",
+    "refrigerator is idle",
+    "closet is idle",
+    "bed is idle",
+    "desk is idle",
+    "Abigail Chen is playing a game",
+    "desk is cluttered with books and papers",
+    "Abigail Chen is browsing the internet",
+    "bed is occupied",
+    "Abigail Chen is reading a book",
+    "desk is unoccupied",
+    "Abigail Chen is checking her emails",
+    "closet is idle",
+    "bed is idle",
+    "desk is idle",
+    "cooking area is idle",
+    "kitchen sink is idle",
+    "toaster is idle",
+    "refrigerator is idle",
+    "common room table is strewn with snacks and drinks",
+    "Rajiv Patel is discussing the show with friends",
+    "Abigail Chen is checking her emails",
+    "common room table is idle",
+    "Abigail Chen is taking a few deep breaths",
+    "Hailey Johnson is brainstorming ideas for her novel",
+    "common room sofa is idle",
+    "common room sofa is being sat on",
+    "common room sofa is in use",
+    "Rajiv Patel is watching the show",
+    "common room sofa is being sat on by Hailey Johnson",
+    "Hailey Johnson is watching the new show",
+    "common room table is idle",
+    "Abigail Chen is taking a few deep breaths",
+    "common room table is being used as a platform for a laptop and books",
+    "Abigail Chen is browsing the web for inspiration",
+    "common room sofa is idle",
+    "common room sofa is in use",
+    "Rajiv Patel is watching the show",
+    "common room sofa is being sat on by Hailey Johnson",
+    "Hailey Johnson is watching the new show",
+    "common room table is idle",
+    "cooking area is idle",
+    "kitchen sink is idle",
+    "toaster is idle",
+    "refrigerator is idle",
+    "Abigail Chen is browsing the web for inspiration",
+    "desk is empty and unused",
+    "Abigail Chen is checking her emails",
+    "bed is unoccupied",
+    "closet is idle",
+    "bed is idle",
+    "desk is idle",
+    "Abigail Chen is checking her phone for notifications",
+    "cooking area is idle",
+    "kitchen sink is idle",
+    "toaster is idle",
+    "refrigerator is idle",
+    "common room sofa is in use",
+    "Rajiv Patel is watching the show",
+    "common room sofa is being sat on by Hailey Johnson",
+    "Hailey Johnson is watching the new show",
+    "Abigail Chen is checking her phone for notifications",
+    "common room sofa is idle",
+    "common room table is idle",
+    "common room sofa is being used by Abigail Chen",
+    "Abigail Chen is taking a break to stretch",
+    "common room sofa is in use",
+    "Rajiv Patel is watching the show",
+    "common room sofa is being sat on by Hailey Johnson",
+    "Hailey Johnson is watching the new show",
+]
