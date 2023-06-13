@@ -13,6 +13,9 @@ class EnvNode:
             "state": self.state
         }
     
+    def is_leaf(self):
+        return len(self.children) == 0
+    
     def print(self):
         print(json.dumps(self.to_dict(), indent=1))
 

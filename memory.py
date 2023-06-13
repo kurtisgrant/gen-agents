@@ -31,6 +31,10 @@ class Memory_Stream:
         self.memories_dict = defaultdict(dict)  # New dictionary for quick access
         self.verbosity = 2
 
+    def cast_importances_to_floats(self):
+        for memory in self.memories:
+            memory["importance"] = float(memory["importance"])
+
     def add_memory(self, type, content):
         if type not in ["OBSERVATION", "REFLECTION", "ACTION"]:
             raise Exception("Invalid memory type")
@@ -69,7 +73,7 @@ class Memory_Stream:
             except Exception as e:
                 print(e)
                 continue
-        return response['rating']
+        return float(response['rating'])
     
     def recalculate_importances(self, verbose=False):
         for memory in self.memories:
@@ -115,51 +119,63 @@ class Memory_Stream:
         recency_score = 0.99 ** hours_since_last_accessed
         return recency_score
     
-    def query(self, query=None, num_results=5, weights=(0.5, 0.3, 0.2), verbose=False):
+    def query(self, query=None, num_results=5, weights=(0.5, 0.3, 0.2)):
         if self.verbosity > 0:
             print(f"\nQuerying: \"{query}\"...")
         recent_memories = self.get_recent_memories(50)
-        memory_scores = []
+        memory_scores = {}
 
         for memory in recent_memories:
+            scores = {}
             if query is not None:
                 query_embedding = embeddings.embed_query(query)
-                relevance = np.dot(memory["embedded_content"], query_embedding)
+                scores['relevance'] = np.dot(memory["embedded_content"], query_embedding)
             else:
-                relevance = 0
-            importance = float(memory["importance"]) / 10.0  # Normalize importance
-            recency = self.get_recency(memory["id"])
+                scores['relevance'] = 0.0
+            scores['importance'] = memory['importance']
+            scores['recency'] = self.get_recency(memory['id'])
+            scores['id'] = memory['id']
+            memory_scores[memory['id']] = scores
+        
+        # Min-max normalize scores
+        for score_type in ['relevance', 'importance', 'recency']:
+            scores = [memory_scores[memory_id][score_type] for memory_id in memory_scores]
+            min_score = min(scores)
+            max_score = max(scores)
+            for memory_id in memory_scores:
+                memory_scores[memory_id][score_type] = (memory_scores[memory_id][score_type] - min_score) / (max_score - min_score)
 
-            # Weight the scores
-            weighted_score = weights[0] * relevance + weights[1] * importance + weights[2] * recency
+        # Calculate final scores
+        for memory_id, scores in memory_scores.items():
+            memory_object = self.get_memory(memory_id)
+            scores['score'] = weights[0] * scores['relevance'] + weights[1] * scores['importance'] + weights[2] * scores['recency']
 
             if self.verbosity > 2:
-                print(f"\nMemory: [node_{memory['id']}] {memory['timestamp']}: {memory['content']}")
-                print(f"Relevance: {relevance}")
-                print(f"Weighted relevance: {weights[0] * relevance}")
-                print(f"Importance: {importance}")
-                print(f"Weighted importance: {weights[1] * importance}")
-                print(f"Recency: {recency}")
-                print(f"Weighted recency: {weights[2] * recency}")
-                print(f"Weighted score: {weighted_score}")
+                print(f"\nMemory: [node_{memory_object['id']}] {memory_object['timestamp']}: {memory_object['content']}")
+                print(f"Relevance: {scores['relevance']}")
+                print(f"Importance: {scores['importance']}")
+                print(f"Recency: {scores['recency']}")
+                print(f"Score: {scores['score']}")
 
-            memory_scores.append((weighted_score, memory))
-
-        # Use heapq to get the top memories
-        top_memories = heapq.nlargest(num_results, memory_scores)
-        # Extract the memory from each tuple in top_memories
-        memories_to_return = [memory for score, memory in top_memories]
+        # Sort memories by score
+        top_memory_scores = sorted(memory_scores.values(), key=lambda x: x['score'], reverse=True)[:num_results]
 
         if self.verbosity > 1:
             print("Query results:")
 
         # Update the last accessed time for each memory
-        for score, memory in top_memories:
+        for memory_scores in top_memory_scores:
+            memory = self.get_memory(memory_scores['id'])
             if self.verbosity > 1:
+                score = memory_scores['score']
                 # Fix score to 3 decimal places
                 score = "{:.3f}".format(score)
                 print(f"Scoring {score}) [node_{memory['id']}] {memory['timestamp']}: {memory['content']}")
             self.access(memory["id"])
+        
+        # Get the actual unaltered memory objects
+        memories_to_return = [self.get_memory(memory_scores['id']) for memory_scores in top_memory_scores]
+
         return memories_to_return
 
     
@@ -226,7 +242,7 @@ class Memory_Stream:
         for topic in topics.values():
             if self.verbosity > 2:
                 print(f"\n\nTopic: {topic}")
-            memories = self.query(query=topic, num_results=5, verbose=verbose)
+            memories = self.query(query=topic, num_results=5)
             memory_strings = fstring_memories(memories)
             memories_string = '\n\n'.join(memory_strings)
             topic_reflections = self.extract_insights(memory_strings)
