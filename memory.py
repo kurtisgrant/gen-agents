@@ -35,9 +35,11 @@ class Memory_Stream:
         for memory in self.memories:
             memory["importance"] = float(memory["importance"])
 
-    def add_memory(self, type, content):
+    def add_memory(self, type, content, references=None):
         if type not in ["OBSERVATION", "REFLECTION", "ACTION"]:
             raise Exception("Invalid memory type")
+        if type == "REFLECTION" and references is None:
+            raise Exception("Reflections must have references")
         memory = {
             "id": self.mem_count,
             "timestamp": self.sandbox.get_time(),
@@ -47,10 +49,15 @@ class Memory_Stream:
             "importance": self.get_importance(content),
             "embedded_content": embeddings.embed_query(content)
         }
+        if references:
+            memory["references"] = references
         self.mem_count += 1
         self.memories.append(memory)
         self.memories_dict[memory["id"]] = memory  # Store memory in dict as well
         return memory
+    
+    def add_reflection(self, content, references):
+        return self.add_memory(type="REFLECTION", content=content, references=references)
 
     def get_importance(self, memory_str):
 
@@ -195,22 +202,26 @@ class Memory_Stream:
             print("\nExtracting insights...")
         insights_template = PromptTemplate(
             input_variables = ['memories', 'format_instructions'],
-            template = 'What 5 high-level insights can you infer from the memories provided  \n\nMEMORIES: {memories}\n\n{format_instructions}\n\n'
+            template = 'What 3 high-level useful insights can you infer from the memories provided?\n\nMEMORIES: {memories}\n\n{format_instructions}\n\n'
         )
         insights_chain = LLMChain(llm=llm, prompt=insights_template, verbose=False)
 
         schema1 = ResponseSchema(name='insight1', description='The first insight', type='string')
+        references1 = ResponseSchema(name='references1', description='List of ids for referenced memories for first insight. eg. "2, 5, 12"', type='string')
         schema2 = ResponseSchema(name='insight2', description='The second insight', type='string')
+        references2 = ResponseSchema(name='references2', description='List of ids for referenced memories for second insight. eg. "2, 5, 12"', type='string')
         schema3 = ResponseSchema(name='insight3', description='The third insight', type='string')
-        schema4 = ResponseSchema(name='insight4', description='The fourth insight', type='string')
-        schema5 = ResponseSchema(name='insight5', description='The fifth insight', type='string')
-        output_parser = StructuredOutputParser.from_response_schemas([schema1, schema2, schema3, schema4, schema5])
+        references3 = ResponseSchema(name='references3', description='List of ids for referenced memories for third insight. eg. "2, 5, 12"', type='string')
+        output_parser = StructuredOutputParser.from_response_schemas([schema1, references1, schema2, references2, schema3, references3])
         format_instructions = output_parser.get_format_instructions()
 
         insights = output_parser.parse(insights_chain.run(memories="\n\n".join(memories_list), format_instructions=format_instructions))
-        return insights.values()
+        # Put pairs of insights and their references into a list of dicts
+        insights = [{'insight': insights[f'insight{i}'], 'references': insights[f'references{i}']} for i in range(1, 4)]
+
+        return insights
     
-    def reflect(self, context_memories=50):
+    def reflect(self, insight_memories=4, context_memories=50):
         if self.verbosity > 0:
             print("\n\nReflecting...")
         if self.verbosity > 1:
@@ -218,7 +229,7 @@ class Memory_Stream:
         memory_list = self.get_recent_memories(context_memories)
         prompt_template = PromptTemplate(
             input_variables = ['memories', 'format_instructions'],
-            template = 'Given only the memories provided, what are 3 most salient high-level topics we could speak on regarding the subjects in the memories? MEMORIES: {memories}\n\n{format_instructions}\n\n'
+            template = 'Given only the memories provided, what are 3 most salient high-level topics we should reflect on regarding the subjects in the memories? MEMORIES: {memories}\n\n{format_instructions}\n\n'
         )
         generate_topics_chain = LLMChain(llm=llm, prompt=prompt_template, verbose=self.verbosity > 3)
 
@@ -236,28 +247,31 @@ class Memory_Stream:
         if self.verbosity > 1:
             print(f"\nTopics: {topics_string}")
 
-        reflections = []
+        insights = []
 
         # For each topic, use topic as query on memory stream
         for topic in topics.values():
             if self.verbosity > 2:
                 print(f"\n\nTopic: {topic}")
-            memories = self.query(query=topic, num_results=5)
+            memories = self.query(query=topic, num_results=insight_memories)
             memory_strings = fstring_memories(memories)
             memories_string = '\n\n'.join(memory_strings)
-            topic_reflections = self.extract_insights(memory_strings)
-            for reflection in topic_reflections:
-                reflections.append(reflection)
-            topic_reflections_string = '\n'.join(topic_reflections)
+            topic_insights = self.extract_insights(memory_strings)
+            for insight in topic_insights:
+                insights.append(insight)
+            topic_insights_string = '\n'.join([f"\n{insight['insight']}\nReferences: {insight['references']}" for insight in topic_insights])
             if self.verbosity > 2:
-                print(f"\nNew reflections from insights: \n{topic_reflections_string}")
+                print(f"\nNew reflections from insights: \n{topic_insights_string}")
 
-        reflection_memories = []
         if self.verbosity > 0:
             print("\n\nGenerating memories from insights...")
 
-        for reflection in reflections:
-            memory = self.add_memory(type='REFLECTION', content=reflection)
+        reflection_memories = []
+
+        for insight_object in insights:
+            insight = insight_object['insight']
+            references = insight_object['references']
+            memory = self.add_reflection(content=insight, references=references)
             reflection_memories.append(memory)
         
         reflection_memory_strings = fstring_memories(reflection_memories, verbose=True)
@@ -276,12 +290,13 @@ class Memory_Stream:
             self.add_memory(type='OBSERVATION', content=ob)
 
 
-
 def fstring_memories(memories, verbose=False):
     memory_strings = []
     for m in memories:
         memory_string = f"[node_{m['id']}] {m['timestamp']}: {m['content']}"
         if verbose:
             memory_string = f"[node_{m['id']}] {m['timestamp']} (i:{m['importance']}): {m['content']}"
+        if 'references' in m and m['references'] is not None:
+            memory_string += f" (because of {m['references']})"
         memory_strings.append(memory_string)
     return memory_strings
