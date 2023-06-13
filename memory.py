@@ -126,10 +126,10 @@ class Memory_Stream:
         recency_score = 0.99 ** hours_since_last_accessed
         return recency_score
     
-    def query(self, query=None, num_results=5, weights=(0.5, 0.3, 0.2)):
+    def query(self, query=None, num_results=5, weights=(0.5, 0.3, 0.2), num_memories=50):
         if self.verbosity > 0:
             print(f"\nQuerying: \"{query}\"...")
-        recent_memories = self.get_recent_memories(50)
+        recent_memories = self.get_recent_memories(num_memories)
         memory_scores = {}
 
         for memory in recent_memories:
@@ -150,6 +150,9 @@ class Memory_Stream:
             min_score = min(scores)
             max_score = max(scores)
             for memory_id in memory_scores:
+                # If all scores are the same, set all scores to 1
+                if min_score == max_score:
+                    memory_scores[memory_id][score_type] = 1.0
                 memory_scores[memory_id][score_type] = (memory_scores[memory_id][score_type] - min_score) / (max_score - min_score)
 
         # Calculate final scores
@@ -221,12 +224,12 @@ class Memory_Stream:
 
         return insights
     
-    def reflect(self, insight_memories=4, context_memories=50):
+    def reflect(self, insight_memories=4, num_memories=25):
         if self.verbosity > 0:
             print("\n\nReflecting...")
         if self.verbosity > 1:
             print("\nIdentifying topics...")
-        memory_list = self.get_recent_memories(context_memories)
+        memory_list = self.get_recent_memories(num_memories)
         prompt_template = PromptTemplate(
             input_variables = ['memories', 'format_instructions'],
             template = 'Given only the memories provided, what are 3 most salient high-level topics we should reflect on regarding the subjects in the memories? MEMORIES: {memories}\n\n{format_instructions}\n\n'
@@ -253,11 +256,21 @@ class Memory_Stream:
         for topic in topics.values():
             if self.verbosity > 2:
                 print(f"\n\nTopic: {topic}")
-            memories = self.query(query=topic, num_results=insight_memories)
+            memories = self.query(query=topic, num_results=insight_memories, num_memories=num_memories)
             memory_strings = fstring_memories(memories)
             memories_string = '\n\n'.join(memory_strings)
             topic_insights = self.extract_insights(memory_strings)
             for insight in topic_insights:
+                # If references contain one or more "node_" prefix, remove them
+                references = insight['references']
+                # Check if references string contains "node_" prefix
+                if "node_" in references:
+                    # Remove "node_" prefix from each reference
+                    references = [reference.replace("node_", "") for reference in references.split(',')]
+                    # Join references back into a string
+                    references = ','.join(references)
+                    # Update references in insight dict
+                    insight['references'] = references
                 insights.append(insight)
             topic_insights_string = '\n'.join([f"\n{insight['insight']}\nReferences: {insight['references']}" for insight in topic_insights])
             if self.verbosity > 2:
