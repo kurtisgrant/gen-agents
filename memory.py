@@ -29,6 +29,7 @@ class Memory_Stream:
         self.mem_count = 0
         self.memories = []
         self.memories_dict = defaultdict(dict)  # New dictionary for quick access
+        self.verbosity = 2
 
     def add_memory(self, type, content):
         if type not in ["OBSERVATION", "REFLECTION", "ACTION"]:
@@ -115,7 +116,9 @@ class Memory_Stream:
         return recency_score
     
     def query(self, query=None, num_results=5, weights=(0.5, 0.3, 0.2), verbose=False):
-        recent_memories = self.get_recent_memories()
+        if self.verbosity > 0:
+            print(f"\nQuerying: \"{query}\"...")
+        recent_memories = self.get_recent_memories(50)
         memory_scores = []
 
         for memory in recent_memories:
@@ -130,7 +133,7 @@ class Memory_Stream:
             # Weight the scores
             weighted_score = weights[0] * relevance + weights[1] * importance + weights[2] * recency
 
-            if verbose:
+            if self.verbosity > 2:
                 print(f"\nMemory: [node_{memory['id']}] {memory['timestamp']}: {memory['content']}")
                 print(f"Relevance: {relevance}")
                 print(f"Weighted relevance: {weights[0] * relevance}")
@@ -146,11 +149,16 @@ class Memory_Stream:
         top_memories = heapq.nlargest(num_results, memory_scores)
         # Extract the memory from each tuple in top_memories
         memories_to_return = [memory for score, memory in top_memories]
+
+        if self.verbosity > 1:
+            print("Query results:")
+
         # Update the last accessed time for each memory
         for score, memory in top_memories:
-            if verbose:
-                print(f"\nMemory: [node_{memory['id']}] {memory['timestamp']}: {memory['content']}")
-                print(f"Weighted score: {score}")
+            if self.verbosity > 1:
+                # Fix score to 3 decimal places
+                score = "{:.3f}".format(score)
+                print(f"Scoring {score}) [node_{memory['id']}] {memory['timestamp']}: {memory['content']}")
             self.access(memory["id"])
         return memories_to_return
 
@@ -167,11 +175,13 @@ class Memory_Stream:
         return [memory["content"] for memory in memories_list]
     
     def extract_insights(self, memories_list):
+        if self.verbosity > 0:
+            print("\nExtracting insights...")
         insights_template = PromptTemplate(
             input_variables = ['memories', 'format_instructions'],
             template = 'What 5 high-level insights can you infer from the memories provided  \n\nMEMORIES: {memories}\n\n{format_instructions}\n\n'
         )
-        insights_chain = LLMChain(llm=llm, prompt=insights_template, verbose=True)
+        insights_chain = LLMChain(llm=llm, prompt=insights_template, verbose=False)
 
         schema1 = ResponseSchema(name='insight1', description='The first insight', type='string')
         schema2 = ResponseSchema(name='insight2', description='The second insight', type='string')
@@ -182,39 +192,65 @@ class Memory_Stream:
         format_instructions = output_parser.get_format_instructions()
 
         insights = output_parser.parse(insights_chain.run(memories="\n\n".join(memories_list), format_instructions=format_instructions))
-        return insights
+        return insights.values()
     
-    def reflect(self, verbose=False):
-        memory_list = self.get_recent_memories(50)
+    def reflect(self, context_memories=50):
+        if self.verbosity > 0:
+            print("\n\nReflecting...")
+        if self.verbosity > 1:
+            print("\nIdentifying topics...")
+        memory_list = self.get_recent_memories(context_memories)
         prompt_template = PromptTemplate(
             input_variables = ['memories', 'format_instructions'],
-            template = 'Given only the memories above, what are 3 most salient high-level questions we can answer about the subjects in the statements? MEMORIES: {memories}\n\n{format_instructions}\n\n'
+            template = 'Given only the memories provided, what are 3 most salient high-level topics we could speak on regarding the subjects in the memories? MEMORIES: {memories}\n\n{format_instructions}\n\n'
         )
-        generate_questions_chain = LLMChain(llm=llm, prompt=prompt_template, verbose=True)
+        generate_topics_chain = LLMChain(llm=llm, prompt=prompt_template, verbose=self.verbosity > 3)
 
-        question1_schema = ResponseSchema(name='question1', description='The first generated question', type='string')
-        question2_schema = ResponseSchema(name='question2', description='The second generated question', type='string')
-        question3_schema = ResponseSchema(name='question3', description='The third generated question', type='string')
-        output_parser = StructuredOutputParser.from_response_schemas([question1_schema, question2_schema, question3_schema])
+        topic1_schema = ResponseSchema(name='topic1', description='The first generated topic', type='string')
+        topic2_schema = ResponseSchema(name='topic2', description='The second generated topic', type='string')
+        topic3_schema = ResponseSchema(name='topic3', description='The third generated topic', type='string')
+        output_parser = StructuredOutputParser.from_response_schemas([topic1_schema, topic2_schema, topic3_schema])
         format_instructions = output_parser.get_format_instructions()
 
         memories_string = "\n\n".join(fstring_memories(memory_list))
-        questions = output_parser.parse(generate_questions_chain.run(memories=memories_string, format_instructions=format_instructions))
+        topics = output_parser.parse(generate_topics_chain.run(memories=memories_string, format_instructions=format_instructions))
 
-        # For each question, use question as query on memory stream
-        for question in questions.values():
-            if verbose:
-                print(f"\n\nQuestion: {question}")
-            memories = self.query(query=question, num_results=5, verbose=verbose)
+        topics_string = ', '.join(topics.values())
+        
+        if self.verbosity > 1:
+            print(f"\nTopics: {topics_string}")
+
+        reflections = []
+
+        # For each topic, use topic as query on memory stream
+        for topic in topics.values():
+            if self.verbosity > 2:
+                print(f"\n\nTopic: {topic}")
+            memories = self.query(query=topic, num_results=5, verbose=verbose)
             memory_strings = fstring_memories(memories)
             memories_string = '\n\n'.join(memory_strings)
-            if verbose:
-                print(f"\n\nRelated Memories: {memories_string}")
-            reflections = self.extract_insights(memory_strings)
-            if verbose:
-                print(f"\n\nReflections: {reflections}")
-            for reflection in reflections.values():
-                self.add_memory(content=reflection, type='REFLECTION')
+            topic_reflections = self.extract_insights(memory_strings)
+            for reflection in topic_reflections:
+                reflections.append(reflection)
+            topic_reflections_string = '\n'.join(topic_reflections)
+            if self.verbosity > 2:
+                print(f"\nNew reflections from insights: \n{topic_reflections_string}")
+
+        reflection_memories = []
+        if self.verbosity > 0:
+            print("\n\nGenerating memories from insights...")
+
+        for reflection in reflections:
+            memory = self.add_memory(type='REFLECTION', content=reflection)
+            reflection_memories.append(memory)
+        
+        reflection_memory_strings = fstring_memories(reflection_memories, verbose=True)
+        reflection_memories_string = '\n'.join(reflection_memory_strings)
+        if self.verbosity > 1:
+            print(f"\nReflections: \n{reflection_memories_string}")
+
+        if 0 < self.verbosity < 2:
+            print(f"\n\nDone reflecting. {len(reflection_memories)} new reflections added to memory stream.")
 
     def load_observations_through_time(self, observations):
         for ob in observations:
@@ -233,82 +269,3 @@ def fstring_memories(memories, verbose=False):
             memory_string = f"[node_{m['id']}] {m['timestamp']} (i:{m['importance']}): {m['content']}"
         memory_strings.append(memory_string)
     return memory_strings
-
-observation_examples = [
-    "common room sofa is idle",
-    "common room sofa is being sat on by Francisco Lopez",
-    "Francisco Lopez is watching a comedy show",
-    "common room table is idle",
-    "cooking area is idle",
-    "kitchen sink is idle",
-    "toaster is idle",
-    "refrigerator is idle",
-    "closet is idle",
-    "bed is idle",
-    "desk is idle",
-    "Abigail Chen is playing a game",
-    "desk is cluttered with books and papers",
-    "Abigail Chen is browsing the internet",
-    "bed is occupied",
-    "Abigail Chen is reading a book",
-    "desk is unoccupied",
-    "Abigail Chen is checking her emails",
-    "closet is idle",
-    "bed is idle",
-    "desk is idle",
-    "cooking area is idle",
-    "kitchen sink is idle",
-    "toaster is idle",
-    "refrigerator is idle",
-    "common room table is strewn with snacks and drinks",
-    "Rajiv Patel is discussing the show with friends",
-    "Abigail Chen is checking her emails",
-    "common room table is idle",
-    "Abigail Chen is taking a few deep breaths",
-    "Hailey Johnson is brainstorming ideas for her novel",
-    "common room sofa is idle",
-    "common room sofa is being sat on",
-    "common room sofa is in use",
-    "Rajiv Patel is watching the show",
-    "common room sofa is being sat on by Hailey Johnson",
-    "Hailey Johnson is watching the new show",
-    "common room table is idle",
-    "Abigail Chen is taking a few deep breaths",
-    "common room table is being used as a platform for a laptop and books",
-    "Abigail Chen is browsing the web for inspiration",
-    "common room sofa is idle",
-    "common room sofa is in use",
-    "Rajiv Patel is watching the show",
-    "common room sofa is being sat on by Hailey Johnson",
-    "Hailey Johnson is watching the new show",
-    "common room table is idle",
-    "cooking area is idle",
-    "kitchen sink is idle",
-    "toaster is idle",
-    "refrigerator is idle",
-    "Abigail Chen is browsing the web for inspiration",
-    "desk is empty and unused",
-    "Abigail Chen is checking her emails",
-    "bed is unoccupied",
-    "closet is idle",
-    "bed is idle",
-    "desk is idle",
-    "Abigail Chen is checking her phone for notifications",
-    "cooking area is idle",
-    "kitchen sink is idle",
-    "toaster is idle",
-    "refrigerator is idle",
-    "common room sofa is in use",
-    "Rajiv Patel is watching the show",
-    "common room sofa is being sat on by Hailey Johnson",
-    "Hailey Johnson is watching the new show",
-    "Abigail Chen is checking her phone for notifications",
-    "common room sofa is idle",
-    "common room table is idle",
-    "common room sofa is being used by Abigail Chen",
-    "Abigail Chen is taking a break to stretch",
-    "common room sofa is in use",
-    "Rajiv Patel is watching the show",
-    "common room sofa is being sat on by Hailey Johnson",
-    "Hailey Johnson is watching the new show",
-]
